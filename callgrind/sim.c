@@ -391,18 +391,35 @@ CacheModelResult cachesim_D1_ref(Addr a, UChar size)
  *  CacheModelResult cachesim_D1_Write(Addr a, UChar size)
  */
 
-static
-uint64_t GetPhysicalPageFrameNumber(Addr virtualAddress) {
+int fd = -1;
+
+static 
+void init_pagemap_fd(void) {
     char pagemapPath[256];
     VG_(snprintf)(pagemapPath, sizeof(pagemapPath), "/proc/self/pagemap");
 
-    SysRes fd = VG_(open)(pagemapPath, (O_RDONLY), (S_IRUSR));
+    SysRes res = VG_(open)(pagemapPath, (O_RDONLY), 0);
 
-    if (sr_isError(fd) || (Int)sr_Res(fd) == -1 ) {
-        //VG_(perror)("Error: Cannot open pagemap file");
-        //perror("Error: Cannot open pagemap file");
-        VG_(printf)("Error: Cannot open pagemap file\n");
-        return -1;
+    if (sr_Err(res) || (Int)sr_Res(res) == -1) {
+      VG_(printf)("Error: Cannot open pagemap file\n");
+    } else {
+      fd = (Int)sr_Res(res);
+      VG_(printf)("fd initialization: %d\n", fd);
+    }
+}
+
+static
+void close_fd(void) {
+    if (fd != -1) {
+        VG_(close(fd));
+        VG_(printf)("Trace finish, close fd\n");
+    }
+}
+
+static
+uint64_t get_PPN(Addr virtualAddress) {
+    if (fd == -1) {
+      return -1;
     }
 
     // compute pread offset, every size of vpn->ppn entry is 8byte
@@ -410,26 +427,30 @@ uint64_t GetPhysicalPageFrameNumber(Addr virtualAddress) {
 
     // use pread to read directly at offset
     uint64_t entry;
-    //ssize_t res = VG_(pread)((Int)sr_Res(fd), &entry, sizeof(entry), offset);
-    SysRes res = VG_(pread)((Int)sr_Res(fd), &entry, sizeof(entry), offset);
+    SysRes res = VG_(pread)(fd, &entry, sizeof(entry), offset);
     if (sr_Res(res)!= sizeof(entry)) {
         VG_(printf)("Error pread() failed, fd: %d, offset: %lld, return: %lld\n",
-          (Int)sr_Res(fd), offset, sr_Res(res));
-        VG_(close)((Int)sr_Res(fd));
+          fd, offset, sr_Res(res));
         return -2;
     }
-    // VG_(printf)("pread() done, fd: %d, offset: %lld, return: %lld\n",(Int)sr_Res(fd), offset, sr_Res(tmp));
-    // VG_(close)((Int)sr_Res(fd));
-    // return -2;
 
-    VG_(close)((Int)sr_Res(fd));
+    /** linux /proc/.../pagemap structure:
+    * Bits 0-54  page frame number (PFN) if present
+    * Bits 0-4   swap type if swapped
+    * Bits 5-54  swap offset if swapped
+    * Bit  55    pte is soft-dirty (see Documentation/vm/soft-dirty.txt)
+    * Bit  56    page exclusively mapped (since 4.2)
+    * Bits 57-60 zero
+    * Bit  61    page is file-page or shared-anon (since 3.5)
+    * Bit  62    page swapped
+    * Bit  63    page present
+    **/
 
     // check P bit(Present), judge whether page is in physical memory
     uint64_t isPresent = entry & (1ULL << 63);
     if (!isPresent) {
-        //VG_(fprintf)(stderr, "Error: Page not present in physical memory.\n");
-        //perror("Error: Page not present in physical memory.");
-        VG_(printf)("Error: Page not present in physical memory, entry: 0x%llx.\n", entry);
+        VG_(printf)("Error: Page not present in physical memory, fd: %d, VPA: 0x%llx, entry: 0x%llx.\n",
+          fd, virtualAddress, entry);
         return -3;
     }
 
@@ -499,11 +520,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 		rest_a = (tmp_tag&~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
 		VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-		//VG_(printf)("[W %lx %lld.%.6ld]\n", rest_a, (long long)ts.tv_sec, ts.tv_nsec/1000);
-    uint64_t ppn = GetPhysicalPageFrameNumber(rest_a);
-    VG_(printf)("W: vpn: 0x%lx -> ppn: 0x%lx\n", rest_a << 12, ppn);
-    //printf("W: vpn: %ud -> ppn: %ud\n", rest_a << 12, ppn);
-    // TODO: pagemap
+    uint64_t ppn = get_PPN(rest_a);
+    VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
 		VG_(printf)("[W %lx]\n", rest_a);
 #endif
@@ -514,11 +532,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 	rest_a = tag | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
 	VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-	//VG_(printf)("[R %lx %lld.%.6ld]\n", rest_a, (long long)ts.tv_sec, ts.tv_nsec/1000);
-  uint64_t ppn = GetPhysicalPageFrameNumber(rest_a);
-  VG_(printf)("R: vpn: 0x%lx -> ppn: 0x%lx\n", rest_a << 12, ppn);
-  //printf("R: vpn: %ud -> ppn: %ud\n", rest_a << 12, ppn);
-  // TODO: pagemap
+  uint64_t ppn = get_PPN(rest_a);
+  VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
 	VG_(printf)("[R %lx]\n", rest_a);
 #endif
@@ -1487,6 +1502,8 @@ static void cachesim_post_clo_init(void)
      VG_(exit)(1);
   }
 
+  init_pagemap_fd();
+
   cachesim_initcache(I1c, &I1);
   cachesim_initcache(D1c, &D1);
   cachesim_initcache(LLc, &LL);
@@ -1839,6 +1856,8 @@ void cachesim_finish(void)
 {
   if (clo_collect_cacheuse)
     cacheuse_finish();
+
+  close_fd();
 }
 
 /*------------------------------------------------------------*/
