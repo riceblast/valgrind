@@ -94,6 +94,9 @@ typedef struct {
    line_use*    use;
 } cache_t2;
 
+const uint64_t MAX_TRACE = 20000000 * 35; // max trace line number (35s)
+uint64_t trace_num = 0;
+
 /*
  * States of flat caches in our model.
  * We use a 2-level hierarchy, 
@@ -515,30 +518,38 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 	// If load miss -> MemRead
 	
 	/* Added code */
-	if (tmp_tag & CACHELINE_DIRTY_UL) { // If victim is dirty, write-back
-		/* If empty, then clean anyway */
-		rest_a = (tmp_tag&~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits);
+  if (trace_num < MAX_TRACE) {
+    if (tmp_tag & CACHELINE_DIRTY_UL) { // If victim is dirty, write-back
+      trace_num++;
+
+      /* If empty, then clean anyway */
+      rest_a = (tmp_tag&~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
-		VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-    uint64_t ppn = get_PPN(rest_a);
-    if (ppn > 0)
-      VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+      VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
+      uint64_t ppn = get_PPN(rest_a);
+      if (ppn > 0)
+        VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
-		VG_(printf)("[W %lx]\n", rest_a);
+      VG_(printf)("[W %lx]\n", rest_a);
 #endif
+  }
 
 	}
 
 	/* LL miss (load/store both) needs MemRead */
-	rest_a = tag | (set_no << c->line_size_bits);
+  if (trace_num < MAX_TRACE) {
+    trace_num++;
+
+    rest_a = tag | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
-	VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-  uint64_t ppn = get_PPN(rest_a);
-  if (ppn > 0)
-    VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+    VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
+    uint64_t ppn = get_PPN(rest_a);
+    if (ppn > 0)
+      VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
-	VG_(printf)("[R %lx]\n", rest_a);
+    VG_(printf)("[R %lx]\n", rest_a);
 #endif
+  }
 
     return (tmp_tag & CACHELINE_DIRTY) ? MissDirty : Miss;
 }
@@ -1505,6 +1516,7 @@ static void cachesim_post_clo_init(void)
   }
 
   init_pagemap_fd();
+  VG_(umsg)("MAX Trace linenum: %lu\n", MAX_TRACE);
 
   cachesim_initcache(I1c, &I1);
   cachesim_initcache(D1c, &D1);
