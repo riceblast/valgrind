@@ -401,10 +401,10 @@ void init_pagemap_fd(void) {
     SysRes res = VG_(open)(pagemapPath, (O_RDONLY), 0);
 
     if (sr_Err(res) || (Int)sr_Res(res) == -1) {
-      VG_(printf)("Error: Cannot open pagemap file\n");
+      VG_(umsg)("Error: Cannot open pagemap file\n");
     } else {
       fd = (Int)sr_Res(res);
-      VG_(printf)("fd initialization: %d\n", fd);
+      VG_(umsg)("fd initialization: %d\n", fd);
     }
 }
 
@@ -412,7 +412,7 @@ static
 void close_fd(void) {
     if (fd != -1) {
         VG_(close(fd));
-        VG_(printf)("Trace finish, close fd\n");
+        VG_(umsg)("Trace finish, close fd\n");
     }
 }
 
@@ -521,7 +521,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 #ifdef TRACE_TIMESTAMP
 		VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
     uint64_t ppn = get_PPN(rest_a);
-    VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+    if (ppn > 0)
+      VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
 		VG_(printf)("[W %lx]\n", rest_a);
 #endif
@@ -533,7 +534,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 #ifdef TRACE_TIMESTAMP
 	VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
   uint64_t ppn = get_PPN(rest_a);
-  VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+  if (ppn > 0)
+    VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
 #else
 	VG_(printf)("[R %lx]\n", rest_a);
 #endif
