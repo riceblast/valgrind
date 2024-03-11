@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <assert.h>
 
 
 
@@ -71,6 +72,12 @@ typedef struct {
   ULong* use_base;
 } line_loaded;  
 
+typedef struct {
+  UWord tag;  // contain dirty info at Bit0
+  uint64_t vpa; // cacheline addr
+  uint64_t ppa; // cachelin physical addr
+} addr_mapping;
+
 /* Cache state */
 typedef struct {
    const HChar* name;
@@ -85,6 +92,7 @@ typedef struct {
    UWord        tag_mask;
    HChar        desc_line[128];    // large enough
    UWord*       tags;
+  addr_mapping*  mappings;
 
   /* for cache use */
    int          line_size_mask;
@@ -182,6 +190,8 @@ static void cachesim_clearcache(cache_t2* c)
       c->tags[i] = i % c->assoc; /* init lower bits as pointer */
     }
   }
+
+  c->mappings = NULL;
 }
 
 static void cacheuse_initcache(cache_t2* c);
@@ -220,9 +230,24 @@ static void cachesim_initcache(cache_t config, cache_t2* c)
        cacheuse_initcache(c);
    else
      c->use = 0;
+
    cachesim_clearcache(c);
 }
 
+// initialize mapping-shadow cache in LLC
+static void mapping_initcache(cache_t2* c) 
+{
+  c->mappings = (addr_mapping*) CLG_MALLOC("cl.sim.cs_ic.1",
+                                 sizeof(addr_mapping) * c->sets * c->assoc);
+  VG_(printf)("mappings initialization success, cache size: %d\n",
+    c->sets * c->assoc * 64);
+
+  for (int i = 0; i < c->assoc * c->sets; i++) {
+    c->mappings[i].tag = 0;
+    c->mappings[i].vpa = 0;
+    c->mappings[i].ppa = 0;
+  }
+}
 
 #if 0
 static void print_cache(cache_t2* c)
@@ -416,11 +441,21 @@ void close_fd(void) {
     }
 }
 
+// get ppn of virtualAddress, 0 for read and 1 for write
 static
-uint64_t get_PPN(Addr virtualAddress) {
+uint64_t get_PPN(Addr virtualAddress, int rw) {
+
+    //init_pagemap_fd();
+
     if (fd == -1) {
       return -1;
     }
+
+    // access virtualAddress to ensure physical page exist
+    // uint64_t tmp = *((uint64_t *)virtualAddress);
+    // uint8_t tmp2 = *((uint8_t *)virtualAddress);
+    // *((uint8_t *)virtualAddress) = (uint8_t)0;
+    // *((uint8_t *)virtualAddress) = tmp2;
 
     // compute pread offset, every size of vpn->ppn entry is 8byte
     size_t offset = (virtualAddress / 4096) * sizeof(uint64_t);
@@ -429,8 +464,9 @@ uint64_t get_PPN(Addr virtualAddress) {
     uint64_t entry;
     SysRes res = VG_(pread)(fd, &entry, sizeof(entry), offset);
     if (sr_Res(res)!= sizeof(entry)) {
-        VG_(printf)("Error pread() failed, fd: %d, offset: %lld, return: %lld\n",
+        VG_(printf)("Error pread() failed, fd: %d, offset: %lu, return: %lu\n",
           fd, offset, sr_Res(res));
+        //close_fd();
         return -2;
     }
 
@@ -449,15 +485,201 @@ uint64_t get_PPN(Addr virtualAddress) {
     // check P bit(Present), judge whether page is in physical memory
     uint64_t isPresent = entry & (1ULL << 63);
     if (!isPresent) {
-        VG_(printf)("Error: Page not present in physical memory, fd: %d, VPA: 0x%llx, entry: 0x%llx.\n",
-          fd, virtualAddress, entry);
+        char type;
+        if (rw == 0) {
+          type = 'r';
+        } else {
+          type = 'w';
+        }
+        VG_(printf)("Error: Page not present in physical memory, type: %c, fd: %d, VPN: 0x%lx entry: 0x%lx.\n",
+          type, fd, virtualAddress >> 12, entry);
+        //close_fd();
         return -3;
     }
 
+    // check 57~60Bit, they are supposed to be 0
+    if ((entry & 0x1E00000000000000UL) != 0x0UL) {
+      VG_(printf)("Error: pagemap entry is invalid: 0x%lx\n", entry);
+      return -4;
+    }
+
+    //close_fd();
     // the 54~0 bit is PPN
     uint64_t pageFrameNumber = entry & ((1ULL << 55) - 1);
 
     return pageFrameNumber;
+}
+
+/*
+ * for mappings cache:
+ * 1. read hit: update mapping info
+ * 2. read miss: insert mapping info; evict block
+ * 3. write hit: update mapping info
+ * 4. write miss: insert mapping info; evict block (write allocator)
+ * the state of cacheline in mapping cache should be same as in cache
+ */
+static
+addr_mapping* find_mapping(cache_t2 *c, RefType ref, UInt set_no, UWord tag)
+{
+    addr_mapping *map_set = &(c->mappings[set_no * c->assoc]);
+
+    /* This loop is unrolled for just the first case, which is the most */
+    /* common.  We can't unroll any further because it would screw up   */
+    /* if we have a direct-mapped (1-way) cache.                        */
+
+    if (tag == (map_set[0].tag & ~CACHELINE_DIRTY_UL))
+      return map_set;
+    
+    /* If the tag is one other than the MRU, move it into the MRU spot  */
+    /* and shuffle the rest down.                                       */
+	  for (int i = 1; i < c->assoc; i++) {
+		  if (tag == (map_set[i].tag & ~CACHELINE_DIRTY_UL))
+			  return &(map_set[i]);
+	  }
+
+    // not found
+    return NULL;
+}
+
+// read hit/write hit
+// just update the ppn of an already existed map_entry
+static
+void update_mapping(cache_t2 *c, RefType ref, UInt set_no, UWord tag, Addr a, char hit_type)
+{
+    addr_mapping *map_set = &(c->mappings[set_no * c->assoc]);
+
+    /* This loop is unrolled for just the first case, which is the most */
+    /* common.  We can't unroll any further because it would screw up   */
+    /* if we have a direct-mapped (1-way) cache.                        */
+    if (tag == (map_set[0].tag & ~CACHELINE_DIRTY_UL)) {
+      uint64_t ppn = get_PPN(map_set[0].vpa, ref);
+      map_set[0].tag = tag | ref;
+      map_set[0].ppa = (ppn << 12) | (map_set[0].vpa & 0xFFF);
+      return;
+    }
+    
+    /* If the tag is one other than the MRU, move it into the MRU spot  */
+    /* and shuffle the rest down.                                       */
+	  for (int i = 1; i < c->assoc; i++) {
+		  if (tag == (map_set[i].tag & ~CACHELINE_DIRTY_UL)) {
+			  UWord tmp_tag = map_set[i].tag | ref; // update dirty flag
+        uint64_t vpa = map_set[i].vpa;
+
+        for (int j = i; j > 0; j--) {
+          map_set[j] = map_set[j - 1];
+        }
+
+        
+        map_set[0].tag = tmp_tag;
+        map_set[0].vpa = vpa;
+        map_set[0].ppa = (get_PPN(vpa, ref) << 12) | (vpa & 0xFFF);
+        return;
+      }
+	  }
+
+  // the mapping block is supposed to be in cache
+    char op_type;
+    if (ref == Read)
+      op_type = 'r';
+    else
+      op_type = 'w';
+    
+    VG_(printf)("%c update mapping_cache_Error: %c hit, set: 0x%x tag: 0x%lx Addr: 0x%lx a: 0x%lx c_a: 0x%lx\n",
+      hit_type, op_type, set_no, tag,
+      (tag & ~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits),
+      a, a & 0xFFFFFFFFFFFFFFc0);
+    return;
+}
+
+// just try to insert new addr_map entry, and return evicted entry
+static
+addr_mapping insert_mapping(cache_t2 *c, RefType ref, UInt set_no, UWord tag) 
+{
+  addr_mapping *map_entry = find_mapping(c, ref, set_no, tag);
+  if (map_entry != NULL) {
+    char op_type;
+    if (ref == Read)
+      op_type = 'r';
+    else
+      op_type = 'w';
+
+    VG_(printf)("insert mapping_cache_Error: %c miss, set: %u tag: %lu Addr: 0x%lx\n",
+      op_type, set_no, tag, (tag & ~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits));
+    VG_(printf)("Entry_Error: %lu %lu %lu\n", map_entry->tag, map_entry->vpa, map_entry->ppa);
+    
+    addr_mapping result = {.tag = 0, .vpa = 0, .ppa = 0};
+    return result;
+  }
+
+  addr_mapping *map_set;
+  addr_mapping victim_map;
+  
+  map_set = &(c->mappings[set_no * c->assoc]);
+  victim_map = map_set[c->assoc - 1];
+
+  for (int j = c->assoc - 1; j > 0; j--) {
+        map_set[j] = map_set[j - 1];
+  }
+
+  uint64_t vpa = (tag & ~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits);
+  uint64_t ppn = get_PPN(vpa, ref);
+  uint64_t ppa = (ppn << 12) | (vpa & 0xFFF);
+
+  map_set[0].tag = (tag | ref);
+  map_set[0].vpa = vpa;
+  map_set[0].ppa = ppa;
+
+  VG_(printf)("\tShadow Miss Insert: 0x%x 0x%lx\n", set_no, tag);
+
+  return victim_map;
+}
+
+static
+void check_mapping(cache_t2 *c)
+{
+  static uint64_t cnt = 0;
+  static int happen = 0;
+  if (!happen) {
+    for (int i = 0; i < c->assoc * c->sets; i++) {
+      if (c->tags[i] != c->mappings[i].tag) {
+        cnt++;
+        if (cnt < 10000) {
+          VG_(printf)("Miss match Error(0x%x): 0x%lx 0x%lx\n", i / c->assoc, c->tags[i], c->mappings[i].tag);
+          happen = 1;
+        }
+      }
+    }
+
+    // if (happen) {
+    //   VG_(printf)("cache: ");
+    //   for (int i = 0; i < c->assoc * c->sets; i++) {
+    //     if (c->tags[i] != 0)
+    //       VG_(printf)("(0x%x 0x%x 0x%lx) ", i, i / c->assoc, c->tags[i]);
+    //   }
+    //   VG_(printf)("\n");
+
+    //   VG_(printf)("sache: ");
+    //   for(int i = 0; i < c->assoc * c->sets; i++) {
+    //     if (c->mappings[i].tag != 0)
+    //       VG_(printf)("(0x%x 0x%x 0x%lx) ", i, i / c->assoc, c->mappings[i].tag);
+    //   }
+    //   VG_(printf)("\n");
+    // }
+  }
+
+  VG_(printf)("cache: ");
+  for (int i = 0; i < c->assoc * c->sets; i++) {
+    if (c->tags[i] != 0)
+      VG_(printf)("(0x%x 0x%x 0x%lx) ", i, i / c->assoc, c->tags[i]);
+  }
+  VG_(printf)("\n");
+
+  VG_(printf)("sache: ");
+  for(int i = 0; i < c->assoc * c->sets; i++) {
+    if (c->mappings[i].tag != 0)
+      VG_(printf)("(0x%x 0x%x 0x%lx) ", i, i / c->assoc, c->mappings[i].tag);
+  }
+  VG_(printf)("\n");
 }
 
 /*
@@ -478,6 +700,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 	struct timespec ts;
 #endif
 
+    check_mapping(c);
+
     set = &(c->tags[set_no * c->assoc]);
 
     /* This loop is unrolled for just the first case, which is the most */
@@ -485,7 +709,11 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
     /* if we have a direct-mapped (1-way) cache.                        */
 
     if (tag == (set[0] & ~CACHELINE_DIRTY_UL)) {
-		set[0] |= ref;
+		    set[0] |= ref;
+        update_mapping(c, ref, set_no, tag, a, '0');
+        VG_(printf)("0 Hit: type: %d set_no: 0x%x tag: 0x%lx\n", ref, set_no, tag);
+        check_mapping(c);
+        VG_(printf)("\n");
         return Hit;
     }
     /* If the tag is one other than the MRU, move it into the MRU spot  */
@@ -499,6 +727,8 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 			}
 			set[0] = tmp_tag;
 
+      update_mapping(c, ref, set_no, tag, a, 'n');
+      VG_(printf)("n Hit\n\n");
 			return Hit;
 		}
 	}
@@ -510,18 +740,36 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
         set[j] = set[j - 1];
     }
     set[0] = tag | ref;
-
+    VG_(printf)("Miss Insert: 0x%x 0x%lx\n", set_no, tag);
 
 	// If load miss -> MemRead
 	
 	/* Added code */
+  addr_mapping map_entry = insert_mapping(c, ref, set_no, tag);
+  if (tmp_tag != map_entry.tag) {
+    VG_(printf)("Tag_Error: 0x%lx 0x%lx\n", tmp_tag, map_entry.tag);
+  }
+
 	if (tmp_tag & CACHELINE_DIRTY_UL) { // If victim is dirty, write-back
 		/* If empty, then clean anyway */
 		rest_a = (tmp_tag&~CACHELINE_DIRTY_UL) | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
 		VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-    uint64_t ppn = get_PPN(rest_a);
-    VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+    uint64_t ppn = get_PPN(rest_a, 1);
+
+    if (ppn <= 0) {
+      ppn = map_entry.ppa >> 12;
+    } else if (ppn != (map_entry.ppa >> 12)) {
+      VG_(printf)("Write_Back_PPN_Error: 0x%lx 0x%lx\n", ppn, (map_entry.ppa >>12));
+    } else if (rest_a != map_entry.vpa) {
+      VG_(printf)("Write_Back_VPA_Error: 0x%lx 0x%lx\n", rest_a, map_entry.vpa);
+    }
+
+    //VG_(printf)("W 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+    VG_(printf)("[W %lx %lld.%.6ld]\n", 
+      rest_a, (long long)ts.tv_sec, ts.tv_nsec/1000);
+    VG_(printf)("W test physical addr 0x%lx %lld.%.6ld\n\n",
+      (ppn << 12) + (rest_a & 0xFFF), (long long)ts.tv_sec, ts.tv_nsec/1000);
 #else
 		VG_(printf)("[W %lx]\n", rest_a);
 #endif
@@ -532,8 +780,20 @@ CacheResult cachesim_setref_wb(cache_t2* c, RefType ref, UInt set_no, UWord tag,
 	rest_a = tag | (set_no << c->line_size_bits);
 #ifdef TRACE_TIMESTAMP
 	VG_(clock_gettime)(&ts, CLOCK_MONOTONIC);
-  uint64_t ppn = get_PPN(rest_a);
-  VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+  uint64_t ppn = get_PPN(rest_a, 0);
+
+  map_entry = *(find_mapping(c, ref, set_no, tag));
+  if (ppn != (map_entry.ppa >> 12)) {
+    VG_(printf)("Read_Miss_PPN_Error: 0x%lx 0x%lx\n", ppn, (map_entry.ppa >>12));
+  }else if (rest_a != map_entry.vpa) {
+    VG_(printf)("Read_Miss_PPN_Error: 0x%lx 0x%lx\n", rest_a, map_entry.vpa);
+  }
+
+  //VG_(printf)("R 0x%lx 0x%lx\n", rest_a, (ppn << 12) + (rest_a & 0xFFF));
+  VG_(printf)("[R %lx %lld.%.6ld]\n", 
+      rest_a, (long long)ts.tv_sec, ts.tv_nsec/1000);
+  VG_(printf)("R test physical addr 0x%lx %lld.%.6ld\n\n",
+    (ppn << 12) + (rest_a & 0xFFF), (long long)ts.tv_sec, ts.tv_nsec/1000);
 #else
 	VG_(printf)("[R %lx]\n", rest_a);
 #endif
@@ -577,7 +837,12 @@ CacheResult cachesim_ref_wb(cache_t2* c, RefType ref, Addr a, UChar size)
 static
 CacheModelResult cachesim_I1_Read(Addr a, UChar size)
 {
-    if ( cachesim_ref( &I1, a, size) == Hit ) return L1_Hit;
+    if ( cachesim_ref( &I1, a, size) == Hit ) {
+      if (LL.tags[0xc8] == 0x1fff000000) {
+        VG_(printf)("----------------I1 Hit DANGER----------------\n");
+      }
+      return L1_Hit;
+    }
     switch( cachesim_ref_wb( &LL, Read, a, size) ) {
 	case Hit: return LL_Hit;
 	case Miss: return MemAccess;
@@ -589,7 +854,12 @@ CacheModelResult cachesim_I1_Read(Addr a, UChar size)
 static
 CacheModelResult cachesim_D1_Read(Addr a, UChar size)
 {
-	if ( cachesim_ref( &D1, a, size) == Hit ) return L1_Hit;
+	if ( cachesim_ref( &D1, a, size) == Hit ) {
+      if (LL.tags[0xc8] == 0x1fff000000) {
+        VG_(printf)("----------------D1 Hit DANGER----------------\n");
+      }
+     return L1_Hit;
+  }
 	switch( cachesim_ref_wb( &LL, Read, a, size) ) {
 		case Hit: 
 			return LL_Hit;
@@ -609,7 +879,13 @@ CacheModelResult cachesim_D1_Write(Addr a, UChar size)
 	 * the write to the LL to make the LL line dirty.
 	 * But this causes no latency, so return the hit.
 	 */
+    if (LL.tags[0xc8] == 0x1fff000000) {
+        VG_(printf)("----------------D1 Write Before DANGER----------------\n");
+    }
 	cachesim_ref_wb( &LL, Write, a, size);
+    if (LL.tags[0xc8] == 0x1fff000000) {
+        VG_(printf)("----------------D1 Write After DANGER----------------\n");
+    }
 	return L1_Hit;
     }
     switch( cachesim_ref_wb( &LL, Write, a, size) ) {
@@ -1507,6 +1783,8 @@ static void cachesim_post_clo_init(void)
   cachesim_initcache(I1c, &I1);
   cachesim_initcache(D1c, &D1);
   cachesim_initcache(LLc, &LL);
+
+  mapping_initcache(&LL);
 
   /* the other cache simulators use the standard helpers
    * with dispatching via simulator struct */
