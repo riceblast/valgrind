@@ -94,7 +94,7 @@ typedef struct {
    line_use*    use;
 } cache_t2;
 
-const uint64_t MAX_TRACE = 20000000 * 65; // max trace line number (35s)
+const uint64_t MAX_TRACE = 20000000 * 150; // max trace line number (150s)
 uint64_t trace_num = 0;
 
 /*
